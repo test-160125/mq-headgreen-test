@@ -1,0 +1,71 @@
+# Throwaway probe: does CodeRabbit act on commands authored by github-actions[bot]?
+#
+# Background: NVIDIA/TensorRT-LLM PR 19268 builds a semantic-conflict review on
+# top of "github-actions[bot] posts @coderabbitai evaluate custom pre-merge check".
+# Nobody has verified that CodeRabbit accepts such a command from a bot author,
+# nor that it accepts any command on an already-merged PR.
+#
+# Arms:
+#   B - on PR open, post the target command as github-actions[bot]
+#   C - on PR open, post the cheap "review" command as github-actions[bot]
+#   D - on merge, post the target command again on the now-merged PR
+#
+# The human control (arm A) is posted by hand, not by this workflow.
+
+name: coderabbit bot-command probe
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: 'PR number to probe'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  probe:
+    name: Post commands as github-actions[bot]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v8
+        env:
+          PULL_NUMBER: ${{ inputs.pull_number || github.event.pull_request.number }}
+          MERGED: ${{ github.event.action == 'closed' && github.event.pull_request.merged }}
+          ACTION: ${{ github.event.action }}
+        with:
+          script: |
+            const number = Number(process.env.PULL_NUMBER);
+            if (!Number.isSafeInteger(number) || number <= 0) {
+              throw new Error(`Bad pull_number: ${process.env.PULL_NUMBER}`);
+            }
+            // A closed-but-not-merged PR carries no signal; skip it.
+            if (process.env.ACTION === 'closed' && process.env.MERGED !== 'true') {
+              core.info('Closed without merging; nothing to probe.');
+              return;
+            }
+            const phase = process.env.ACTION === 'closed' ? 'POST-MERGE' : 'PRE-MERGE';
+            const post = async (body, label) => {
+              const {data} = await github.rest.issues.createComment({
+                ...context.repo, issue_number: number, body,
+              });
+              core.info(`${label}: ${data.html_url}`);
+              await core.summary.addRaw(`- ${phase} ${label}: ${data.html_url}\n`).write();
+            };
+            const target =
+              '@coderabbitai evaluate custom pre-merge check ' +
+              '--name "Bot command probe" --mode warning ' +
+              '--instructions "This is an automation probe, not a code review. ' +
+              'Do not read, fetch or analyse any repository code. ' +
+              'Reply with exactly: BOT_COMMAND_PROBE_OK"';
+            await post(target, `arm ${phase === 'POST-MERGE' ? 'D' : 'B'} (evaluate custom pre-merge check)`);
+            if (phase === 'PRE-MERGE') {
+              await post('@coderabbitai review', 'arm C (review)');
+            }
